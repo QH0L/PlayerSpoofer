@@ -3616,6 +3616,7 @@ F.SYNC = {
 	MAX_LANES = 8, -- receivers accept up to this many lanes per message
 	WARMUP = 0.25, -- wait after creating fresh tracks so remote clients can see them before the first symbol
 	REPEATS = 2, -- how many times a fresh Apply is sent back to back on every lane (receivers ignore duplicates)
+	LOOP = true, -- keep re-sending every local spoof in a loop when nothing new is queued (a late or missed receiver catches the next START)
 	REANNOUNCE_REPEATS = 1,
 	TRACK_IDLE_SECONDS = 30, -- keep the tracks alive this long after the last symbol (always while a local spoof exists) so the next send starts at once
 	WEIGHT = 0.01, -- track weight; whether this hides the pose on other clients is untested
@@ -3633,6 +3634,8 @@ F.syncAlive = true
 F.syncMsgs = {}
 F.syncLanes = {}
 F.syncMid = math.random(0, 255)
+F.syncLoopFrame = false
+F.syncLoopLast = nil
 F.syncWarmUntil = 0
 F.syncAsm = setmetatable({}, { __mode = "k" })
 F.syncLocal = {}
@@ -4049,7 +4052,7 @@ function F.syncFeed(sender, rx, speed)
 end
 
 function F.syncLogLine(text)
-	if F.syncLogCount < 12 then
+	if F.syncLogCount < 80 then
 		F.syncLogCount = F.syncLogCount + 1
 		print(TAG .. "sync: " .. text)
 	end
@@ -4155,11 +4158,39 @@ function F.syncCommit(targetId, entry)
 			warn(TAG .. "sync: applying received spoof failed: " .. toStr(err))
 		end
 	end
+	-- report what could actually be shown on this client, then re-apply once rows have settled
+	local wanted, matched = 0, 0
+	for _ in pairs(entry.stats or {}) do
+		wanted = wanted + 1
+	end
+	for _ in pairs(statData[targetId] or {}) do
+		matched = matched + 1
+	end
+	local row = root and root:FindFirstChild("PlayerEntry_" .. targetId, true)
+	F.syncLogLine(("applied for %s: player=%s row=%s leaderstats=%s stats %d/%d via leaderstats"):format(
+		toStr(targetId),
+		toStr(player ~= nil),
+		toStr(row ~= nil),
+		toStr(player ~= nil and player:FindFirstChild("leaderstats") ~= nil),
+		matched,
+		wanted
+	))
+	for _, delay in ipairs({ 0.4, 1.5 }) do
+		task.delay(delay, function()
+			if F.syncAlive and spoofs[targetId] == entry then
+				pcall(refresh, targetId)
+			end
+		end)
+	end
 end
 
 function F.syncApplySet(sender, targetId, entry, key)
 	local existing = spoofs[targetId]
 	if existing and not existing.remote then
+		if F.syncSeen[targetId] ~= key then
+			F.syncSeen[targetId] = key
+			F.syncLogLine("ignored remote spoof for " .. toStr(targetId) .. " from " .. sender.Name .. ": you have a local edit on that player (press Reset on it to accept theirs)")
+		end
 		return
 	end
 	if F.syncSeen[targetId] == key then
@@ -4229,6 +4260,11 @@ end
 
 -- ---------- sender ----------
 function F.syncEnqueue(targetId, bytes, repeats)
+	if F.syncLoopFrame then
+		-- a fresh Apply/clear beats a looping re-send: drop the rest of it, receivers resync on the next START
+		F.syncLanes = {}
+		F.syncLoopFrame = false
+	end
 	local msgs = F.syncMsgs
 	for i = #msgs, 1, -1 do
 		if msgs[i].target == targetId then
@@ -4244,7 +4280,8 @@ function F.syncSend(targetId, entry)
 		warn(TAG .. "sync: cannot encode spoof for " .. toStr(targetId) .. ": " .. toStr(bytes))
 		return
 	end
-	F.syncLocal[targetId] = bytes
+	F.syncLocal[targetId] = entry -- live entry: the loop re-encodes it so later changes (kills counting up) reach everyone
+	F.syncLogLine("sending spoof for " .. toStr(targetId) .. " (" .. #bytes .. " bytes)")
 	F.syncEnqueue(targetId, bytes, F.SYNC.REPEATS)
 end
 
@@ -4254,9 +4291,36 @@ function F.syncClear(targetId)
 end
 
 function F.syncReannounce()
-	for targetId, bytes in pairs(F.syncLocal) do
-		F.syncEnqueue(targetId, bytes, F.SYNC.REANNOUNCE_REPEATS)
+	if F.SYNC.LOOP then
+		return -- the loop already re-sends every local spoof
 	end
+	for targetId, entry in pairs(F.syncLocal) do
+		local ok, bytes = pcall(F.syncEncodeSet, targetId, entry)
+		if ok then
+			F.syncEnqueue(targetId, bytes, F.SYNC.REANNOUNCE_REPEATS)
+		end
+	end
+end
+
+-- round robin over our own spoofs, in ascending target id order
+function F.syncNextLoopTarget()
+	local keys = {}
+	for targetId in pairs(F.syncLocal) do
+		keys[#keys + 1] = targetId
+	end
+	if #keys == 0 then
+		return nil
+	end
+	table.sort(keys)
+	local last = F.syncLoopLast
+	for _, targetId in ipairs(keys) do
+		if last == nil or targetId > last then
+			F.syncLoopLast = targetId
+			return targetId
+		end
+	end
+	F.syncLoopLast = keys[1]
+	return keys[1]
 end
 
 function F.syncPlanLanes(len)
@@ -4304,6 +4368,10 @@ function F.syncEnsureTracks(count)
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
 	local animator = hum and hum:FindFirstChildOfClass("Animator")
 	if not animator then
+		if F.syncErrCount < 3 then
+			F.syncErrCount = F.syncErrCount + 1
+			warn(TAG .. "sync: cannot send, no Humanoid/Animator on your character yet")
+		end
 		return false, false
 	end
 	if F.syncAnimator ~= animator then
@@ -4353,6 +4421,26 @@ end
 function F.syncTick()
 	if not F.syncLanesBusy() then
 		local msg = table.remove(F.syncMsgs, 1)
+		F.syncLoopFrame = false
+		if not msg and F.SYNC.LOOP then
+			for _ = 1, 8 do
+				local targetId = F.syncNextLoopTarget()
+				if not targetId then
+					break
+				end
+				local entry = F.syncLocal[targetId]
+				local ok, bytes = false, nil
+				if entry and spoofs[targetId] == entry then
+					ok, bytes = pcall(F.syncEncodeSet, targetId, entry)
+				end
+				if ok then
+					msg = { bytes = bytes, repeats = 1 }
+					F.syncLoopFrame = true
+					break
+				end
+				F.syncLocal[targetId] = nil -- replaced or reset locally, stop looping it
+			end
+		end
 		if msg then
 			F.syncMid = (F.syncMid + 1) % 256
 			F.syncLanes = F.syncBuildLanes(msg.bytes, msg.repeats, F.syncMid)
