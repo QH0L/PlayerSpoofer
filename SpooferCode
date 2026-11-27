@@ -168,18 +168,38 @@ local function restoreLabel(label)
 		label.Visible = true
 	end
 end
-local function overrideImage(icon, image)
+-- recompute(newImage) -> image to force, or nil to let the new image through (used for reused core widgets)
+local function overrideImage(icon, image, recompute)
 	local st = imageOverrides[icon]
 	if not st then
 		st = { original = icon.Image }
 		imageOverrides[icon] = st
 		st.conn = icon:GetPropertyChangedSignal("Image"):Connect(function()
-			if st.desired and icon.Image ~= st.desired then
-				st.original = icon.Image
-				icon.Image = st.desired
+			if not st.desired or icon.Image == st.desired then
+				return
 			end
+			st.original = icon.Image
+			if st.recompute then
+				local ok, again = pcall(st.recompute, icon.Image)
+				if ok and again then
+					st.desired = again
+					if icon.Image ~= again then
+						icon.Image = again
+					end
+				else
+					-- a different player's picture: stop overriding, keep what Roblox just set
+					st.desired = nil
+					st.conn:Disconnect()
+					if imageOverrides[icon] == st then
+						imageOverrides[icon] = nil
+					end
+				end
+				return
+			end
+			icon.Image = st.desired
 		end)
 	end
+	st.recompute = recompute
 	st.desired = image
 	icon.Image = image
 end
@@ -2088,6 +2108,30 @@ local function spoofedPlayers()
 end
 -- every spoof replaces the ORIGINAL names only: a replacement is a placeholder until the end,
 -- so if someone is spoofed as your real name, your own spoof does not rename them again
+-- overhead name mode per spoof: nil = auto (each name keeps its own spoof),
+-- "display" = everything overhead shows the display name, "username" = everything shows the username
+function F.overheadText(player, entry)
+	local mode = entry and entry.overhead
+	if mode == "username" then
+		return entry.username or player.Name
+	elseif mode == "display" then
+		return entry.display or entry.username or player.DisplayName
+	end
+	return entry and (entry.display or entry.username) or nil
+end
+function F.overheadList(list)
+	local out = {}
+	for i, item in ipairs(list) do
+		local mode = item.entry and item.entry.overhead
+		if mode then
+			local text = F.overheadText(item.player, item.entry)
+			out[i] = { player = item.player, entry = item.entry, displayNew = text, userNew = text }
+		else
+			out[i] = item
+		end
+	end
+	return out
+end
 local function applyAllNames(text, list, rich)
 	local subs = {}
 	for i, item in ipairs(list) do
@@ -2126,6 +2170,10 @@ local function unwatchTag(label)
 end
 local function processTag(label, list)
 	local st = tagWatch[label]
+	local world = (st and st.world) or (F.isWorldTag ~= nil and F.isWorldTag(label, list)) or false
+	if world then
+		list = F.overheadList(list)
+	end
 	local base = st and st.base or label.Text
 	local replacement = applyAllNames(base, list, label.RichText)
 	if replacement == base then
@@ -2145,14 +2193,18 @@ local function processTag(label, list)
 			return false
 		end
 	end
-	st = { base = base, desired = replacement }
+	st = { base = base, desired = replacement, world = world }
 	tagWatch[label] = st
 	label.Text = replacement
 	st.conn = label:GetPropertyChangedSignal("Text"):Connect(function()
 		if label.Text == st.desired or tagWatch[label] ~= st then
 			return
 		end
-		local fresh = applyAllNames(label.Text, spoofedPlayers(), label.RichText)
+		local current = spoofedPlayers()
+		if st.world then
+			current = F.overheadList(current)
+		end
+		local fresh = applyAllNames(label.Text, current, label.RichText)
 		if fresh ~= label.Text then
 			st.base = label.Text
 			st.desired = fresh
@@ -2172,6 +2224,13 @@ local function inSpoofedCharacter(inst, list)
 end
 local function isWorldTag(label, list)
 	local gui = label:FindFirstAncestorWhichIsA("BillboardGui") or label:FindFirstAncestorWhichIsA("SurfaceGui")
+	if not gui then
+		return false
+	end
+	return F.isWorldGui(gui, list)
+end
+F.isWorldTag = isWorldTag
+function F.isWorldGui(gui, list)
 	if not gui then
 		return false
 	end
@@ -2371,23 +2430,49 @@ local function handleInspectTitle(label, list)
 	end
 	return false
 end
-local function fixImage(d, list)
-	local ov = imageOverrides[d]
-	local base = (ov and ov.original) or d.Image
+function F.swapForList(base, list)
 	if luaType(base) ~= "string" or base == "" then
-		return false
+		return nil
 	end
 	for _, item in ipairs(list) do
 		local fakeId = item.entry.userId
 		if fakeId then
 			local new = swapUserId(base, item.player.UserId, fakeId)
 			if new ~= base then
-				coreImages[d] = true
-				if d.Image ~= new then
-					overrideImage(d, new)
-				end
-				return true
+				return new
 			end
+		end
+	end
+	return nil
+end
+function F.recomputeCoreImage(newImage)
+	return F.swapForList(newImage, spoofedPlayers())
+end
+local function fixImage(d, list)
+	local ov = imageOverrides[d]
+	local base = d.Image
+	if ov and ov.desired and d.Image == ov.desired then
+		base = ov.original
+	end
+	local new = F.swapForList(base, list)
+	if new then
+		coreImages[d] = true
+		if d.Image ~= new or not ov then
+			overrideImage(d, new, F.recomputeCoreImage)
+		end
+		return true
+	end
+	if ov and coreImages[d] then
+		coreImages[d] = nil
+		if d.Image == ov.desired then
+			restoreImage(d) -- still showing our fake: put the real picture back
+		else
+			-- Roblox already put another player's picture here: just stop overriding
+			ov.desired = nil
+			if ov.conn then
+				ov.conn:Disconnect()
+			end
+			imageOverrides[d] = nil
 		end
 	end
 	return false
@@ -2617,6 +2702,7 @@ function F.hideIcon(icon)
 	end
 	local st = { prop = prop, value = icon[prop] }
 	F.friendHidden[icon] = st
+	F.friendSig[icon.Name .. "|" .. icon.ClassName] = true
 	icon[prop] = 1
 	st.conn = icon:GetPropertyChangedSignal(prop):Connect(function()
 		if F.friendHidden[icon] == st and icon[prop] ~= 1 then
@@ -2672,6 +2758,12 @@ function F.isIconFont(d)
 	end)
 	return ok and luaType(family) == "string" and family:lower():find("icon", 1, true) ~= nil
 end
+function F.leftOfNameOrUnlaid(d, nameLabel)
+	if not nameLabel or nameLabel.AbsoluteSize.X == 0 or d.AbsoluteSize.X == 0 then
+		return true -- not laid out yet: trust the remembered signature
+	end
+	return d.AbsolutePosition.X + d.AbsoluteSize.X <= nameLabel.AbsolutePosition.X + 6
+end
 function F.friendIconsIn(row, nameLabel, realFriend)
 	local out = {}
 	for _, d in ipairs(row:GetDescendants()) do
@@ -2692,13 +2784,15 @@ function F.friendIconsIn(row, nameLabel, realFriend)
 				friendy = text:find("friend", 1, true) ~= nil or (iconish and (text:find("people", 1, true) ~= nil or text:find("users", 1, true) ~= nil or text:find("person", 1, true) ~= nil))
 				candidate = iconish and small and leftOfName
 			end
-			if friendy or (realFriend and candidate) then
+			local known = F.friendSig[d.Name .. "|" .. d.ClassName] and F.leftOfNameOrUnlaid(d, nameLabel)
+			if friendy or (realFriend and (candidate or known)) then
 				out[#out + 1] = d
 			end
 		end
 	end
 	return out
 end
+F.friendSig = {}
 F.friendDumped = {}
 function F.dumpRow(player, row, nameLabel)
 	if F.friendDumped[player.UserId] then
@@ -2738,6 +2832,15 @@ function F.releaseDash(label)
 		label.Text = st.original
 	end
 end
+function F.hasDash(userId)
+	local entry = userId and spoofs[userId]
+	for _, text in pairs(entry and entry.stats or {}) do
+		if F.isDash(text) then
+			return true
+		end
+	end
+	return false
+end
 function F.syncDashStats(list)
 	local want = {}
 	local coreList = CoreGuiRoot and CoreGuiRoot:FindFirstChild("PlayerList")
@@ -2756,14 +2859,14 @@ function F.syncDashStats(list)
 						if isTextObject(d) and not isOurs(d) and (F.dashTexts[d] or F.looksNegative(d.Text)) then
 							want[d] = true
 							if not F.dashTexts[d] then
-								local st = { original = d.Text }
+								local st = { original = d.Text, userId = item.player.UserId }
 								F.dashTexts[d] = st
 								d.Text = "-"
 								st.conn = d:GetPropertyChangedSignal("Text"):Connect(function()
 									if F.dashTexts[d] ~= st or d.Text == "-" then
 										return
 									end
-									if F.looksNegative(d.Text) then
+									if F.looksNegative(d.Text) or F.hasDash(st.userId) then
 										st.original = d.Text
 										d.Text = "-"
 									else
@@ -2811,6 +2914,36 @@ function F.syncFriendIcons(list)
 		end
 	end
 end
+F.listWatched = nil
+F.listPending = false
+function F.syncListNow()
+	F.listPending = false
+	local list = spoofedPlayers()
+	pcall(F.syncFriendIcons, list)
+	pcall(F.syncDashStats, list)
+end
+function F.watchCoreList()
+	local coreList = CoreGuiRoot and CoreGuiRoot:FindFirstChild("PlayerList")
+	if not coreList or F.listWatched == coreList then
+		return
+	end
+	F.listWatched = coreList
+	track(coreList.DescendantAdded:Connect(function(d)
+		if not F.anyActive() then
+			return
+		end
+		-- a known friend icon is hidden the moment it is created, before it is drawn
+		if F.friendSig[d.Name .. "|" .. d.ClassName] then
+			F.syncListNow()
+		elseif not F.listPending then
+			F.listPending = true
+			task.defer(F.syncListNow)
+		end
+	end))
+	track(coreList:GetPropertyChangedSignal("Enabled"):Connect(function()
+		F.syncListNow()
+	end))
+end
 local function retagAll(includeWorkspace)
 	local list = spoofedPlayers()
 	local changed, paths = 0, {}
@@ -2856,6 +2989,7 @@ local function retagAll(includeWorkspace)
 	if coreList then
 		visit(coreList, false)
 	end
+	pcall(F.watchCoreList)
 	pcall(F.syncFriendIcons, list)
 	pcall(F.syncDashStats, list)
 	for _, item in ipairs(list) do
@@ -2871,7 +3005,9 @@ local function retagAll(includeWorkspace)
 		pcall(F.scanCore, list)
 	end
 	for label in pairs(tagWatch) do
-		if label.Parent and applyAllNames(tagWatch[label].base, list, label.RichText) == tagWatch[label].base then
+		local st = tagWatch[label]
+		local useList = (st and st.world) and F.overheadList(list) or list
+		if st and label.Parent and applyAllNames(st.base, useList, label.RichText) == st.base then
 			pcall(unwatchTag, label)
 		end
 	end
@@ -2909,6 +3045,7 @@ task.spawn(function()
 			end
 		end
 		if tagLoopAlive and need then
+			pcall(F.watchCoreList)
 			local list = spoofedPlayers()
 			pcall(F.syncFriendIcons, list)
 			pcall(F.syncDashStats, list)
@@ -3011,7 +3148,7 @@ function F.applyCharName(player, entry)
 	local char = player.Character
 	local hum = char and char:FindFirstChildOfClass("Humanoid")
 	if hum then
-		local displayNew = entry and (entry.display or entry.username) or nil
+		local displayNew = F.overheadText(player, entry)
 		if humGuards[hum] then
 			humGuards[hum]:Disconnect()
 			humGuards[hum] = nil
@@ -3032,7 +3169,7 @@ function F.applyCharName(player, entry)
 	if entry then
 		pcall(ensureCoreWatch)
 	end
-	pcall(F.setNameplate, player, entry and (entry.display or entry.username) or nil)
+	pcall(F.setNameplate, player, F.overheadText(player, entry))
 	local ok, changed, paths = pcall(retagAll, entry ~= nil)
 	if not ok then
 		warn(TAG .. "name tag scan failed: " .. toStr(changed))
@@ -3364,6 +3501,41 @@ function F.buildEditor()
 			ed.setPremium(nil)
 		end
 	end)
+	ed.overhead = nil
+	local overheadBtn = make("TextButton", {
+		Size = UDim2.new(1, 0, 0, 34),
+		LayoutOrder = nextOrder(),
+		BackgroundColor3 = COLOR_FIELD,
+		BorderSizePixel = 0,
+		AutoButtonColor = true,
+		Font = font,
+		TextSize = 14,
+		TextColor3 = COLOR_TEXT,
+		Text = "Overhead name: auto",
+	}, panel)
+	make("UICorner", { CornerRadius = UDim.new(0, 8) }, overheadBtn)
+	function ed.setOverhead(value)
+		ed.overhead = value
+		if value == "display" then
+			overheadBtn.Text = "Overhead name: DISPLAY NAME"
+			overheadBtn.BackgroundColor3 = Color3.fromRGB(46, 80, 120)
+		elseif value == "username" then
+			overheadBtn.Text = "Overhead name: USERNAME"
+			overheadBtn.BackgroundColor3 = Color3.fromRGB(90, 60, 120)
+		else
+			overheadBtn.Text = "Overhead name: auto"
+			overheadBtn.BackgroundColor3 = COLOR_FIELD
+		end
+	end
+	overheadBtn.Activated:Connect(function()
+		if ed.overhead == nil then
+			ed.setOverhead("display")
+		elseif ed.overhead == "display" then
+			ed.setOverhead("username")
+		else
+			ed.setOverhead(nil)
+		end
+	end)
 	ed.device = nil
 	local deviceBtn = make("TextButton", {
 		Size = UDim2.new(1, 0, 0, 34),
@@ -3532,6 +3704,7 @@ function F.openEditor(player, aboveMenu)
 	editor.setHideFriend(F.friendPref[player.UserId] == true)
 	editor.setPremium(entry and entry.premium)
 	editor.setDevice(entry and entry.device or nil)
+	editor.setOverhead(entry and entry.overhead or nil)
 	F.rebuildStats(player, entry)
 	F.setStatus("", COLOR_MUTED)
 	editor.gui.Enabled = true
@@ -3570,7 +3743,7 @@ function F.onApply()
 	if next(stats) == nil then
 		stats = nil
 	end
-	if display == "" and username == "" and not rank and rankNumber == nil and not stats and premium == nil and not device then
+	if display == "" and username == "" and not rank and rankNumber == nil and not stats and premium == nil and not device and not editor.overhead then
 		F.resetTarget(targetId)
 		F.setStatus("Nothing entered - showing real values", COLOR_MUTED)
 		return
@@ -3595,6 +3768,7 @@ function F.onApply()
 			hideFriend = F.friendPref[targetId],
 			premium = premium,
 			device = device,
+			overhead = editor.overhead,
 		}
 		if username ~= "" then
 			say("Fetching user...", COLOR_MUTED)
@@ -3690,6 +3864,7 @@ editor.resetBtn.Activated:Connect(function()
 	pcall(F.setFriendPref, editor.targetId, false)
 	editor.setPremium(nil)
 	editor.setDeviceIndex(0)
+	editor.setOverhead(nil)
 	for _, item in ipairs(editor.statBoxes) do
 		item.box.Text = ""
 	end
@@ -4256,6 +4431,8 @@ function F.syncEncodeSet(targetId, entry)
 	if entry.premium == true then lo = lo + 64 end
 	if deviceIndex then ext = ext + 1 end
 	if #statNames > 0 then ext = ext + 2 end
+	if entry.overhead == "display" then ext = ext + 4 end
+	if entry.overhead == "username" then ext = ext + 8 end
 	if ext > 0 then lo = lo + 128 end
 	F.wByte(w, lo)
 	if ext > 0 then
@@ -4350,6 +4527,11 @@ function F.syncDecode(bytes)
 			error("bad device index")
 		end
 		entry.device = option.key
+	end
+	if F.syncHasBit(ext, 4) then
+		entry.overhead = "display"
+	elseif F.syncHasBit(ext, 8) then
+		entry.overhead = "username"
 	end
 	if F.syncHasBit(ext, 2) then
 		local count = F.rByte(r)
