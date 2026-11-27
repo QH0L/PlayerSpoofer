@@ -2598,17 +2598,30 @@ function F.isRealFriend(player)
 	end)
 	return false
 end
+-- hide by transparency, not Visible: the icon keeps its slot so the name stays lined up with the other rows
+function F.iconProp(icon)
+	if isImageObject(icon) then
+		return "ImageTransparency"
+	elseif isTextObject(icon) then
+		return "TextTransparency"
+	end
+	return nil
+end
 function F.hideIcon(icon)
 	if F.friendHidden[icon] then
 		return
 	end
-	local st = { visible = icon.Visible }
+	local prop = F.iconProp(icon)
+	if not prop then
+		return
+	end
+	local st = { prop = prop, value = icon[prop] }
 	F.friendHidden[icon] = st
-	icon.Visible = false
-	st.conn = icon:GetPropertyChangedSignal("Visible"):Connect(function()
-		if F.friendHidden[icon] == st and icon.Visible then
-			st.visible = true
-			icon.Visible = false
+	icon[prop] = 1
+	st.conn = icon:GetPropertyChangedSignal(prop):Connect(function()
+		if F.friendHidden[icon] == st and icon[prop] ~= 1 then
+			st.value = icon[prop]
+			icon[prop] = 1
 		end
 	end)
 end
@@ -2620,7 +2633,7 @@ function F.unhideIcon(icon)
 	F.friendHidden[icon] = nil
 	st.conn:Disconnect()
 	if icon.Parent then
-		icon.Visible = st.visible
+		icon[st.prop] = st.value
 	end
 end
 -- the row of one player in CoreGui.PlayerList: "p_<userId>" if present, else climb from the name label
@@ -2651,23 +2664,64 @@ function F.coreRowOf(list, player)
 	end
 	return nil, nil
 end
-function F.friendIconsIn(row, nameLabel)
+-- the stock list draws its status icons either as small images or as TextLabels in the
+-- BuilderIcons icon font (Text is an icon name). Both kinds left of the name are candidates.
+function F.isIconFont(d)
+	local ok, family = pcall(function()
+		return d.FontFace.Family
+	end)
+	return ok and luaType(family) == "string" and family:lower():find("icon", 1, true) ~= nil
+end
+function F.friendIconsIn(row, nameLabel, realFriend)
 	local out = {}
 	for _, d in ipairs(row:GetDescendants()) do
-		if isImageObject(d) and not isOurs(d) then
-			local ov = imageOverrides[d]
-			local image = toStr((ov and ov.original) or d.Image):lower()
-			local name = d.Name:lower()
-			local thumb = image:find("rbxthumb", 1, true) or image:find("headshot", 1, true) or image:find("avatar", 1, true)
-			local looksFriend = image:find("friend", 1, true) ~= nil or name:find("friend", 1, true) ~= nil
-			local looksIcon = name:find("icon", 1, true) ~= nil and d.AbsoluteSize.X <= 40
+		if d ~= nameLabel and not isOurs(d) and d:IsA("GuiObject") then
 			local leftOfName = (nameLabel == nil) or (d.AbsolutePosition.X + d.AbsoluteSize.X <= nameLabel.AbsolutePosition.X + 6)
-			if not thumb and (looksFriend or (looksIcon and leftOfName)) then
+			local small = d.AbsoluteSize.X <= 40 and d.AbsoluteSize.Y <= 40
+			local friendy, candidate = false, false
+			if isImageObject(d) then
+				local ov = imageOverrides[d]
+				local image = toStr((ov and ov.original) or d.Image):lower()
+				local thumb = image:find("rbxthumb", 1, true) or image:find("headshot", 1, true) or image:find("avatar", 1, true)
+				friendy = not thumb and (image:find("friend", 1, true) ~= nil or d.Name:lower():find("friend", 1, true) ~= nil)
+				candidate = not thumb and image ~= "" and small and leftOfName
+			elseif isTextObject(d) then
+				local st = F.friendHidden[d]
+				local text = toStr(st and st.text or d.Text):lower()
+				local iconish = F.isIconFont(d)
+				friendy = text:find("friend", 1, true) ~= nil or (iconish and (text:find("people", 1, true) ~= nil or text:find("users", 1, true) ~= nil or text:find("person", 1, true) ~= nil))
+				candidate = iconish and small and leftOfName
+			end
+			if friendy or (realFriend and candidate) then
 				out[#out + 1] = d
 			end
 		end
 	end
 	return out
+end
+F.friendDumped = {}
+function F.dumpRow(player, row, nameLabel)
+	if F.friendDumped[player.UserId] then
+		return
+	end
+	F.friendDumped[player.UserId] = true
+	warn(TAG .. "friend icon not found for " .. player.Name .. " in row " .. (row and row:GetFullName() or "<no row>") .. "; send this dump:")
+	if not row then
+		return
+	end
+	print(TAG .. "  name label: " .. (nameLabel and nameLabel:GetFullName() or "<none>"))
+	for _, d in ipairs(row:GetDescendants()) do
+		if d:IsA("GuiObject") then
+			local extra = ""
+			if isTextObject(d) then
+				local okF, fam = pcall(function() return d.FontFace.Family end)
+				extra = " text=" .. toStr(d.Text) .. " font=" .. toStr(okF and fam or "?")
+			elseif isImageObject(d) then
+				extra = " image=" .. toStr(d.Image) .. " rect=" .. toStr(d.ImageRectOffset)
+			end
+			print(("%s  %s [%s] vis=%s pos=%s size=%s%s"):format(TAG, d.Name, d.ClassName, toStr(d.Visible), toStr(d.AbsolutePosition), toStr(d.AbsoluteSize), extra))
+		end
+	end
 end
 F.dashTexts = setmetatable({}, { __mode = "k" })
 function F.looksNegative(text)
@@ -2734,16 +2788,19 @@ function F.syncFriendIcons(list)
 	local coreList = CoreGuiRoot and CoreGuiRoot:FindFirstChild("PlayerList")
 	if coreList then
 		for _, item in ipairs(list) do
-			if item.entry.hideFriend and F.isRealFriend(item.player) then
+			if item.entry.hideFriend then
+				local real = F.isRealFriend(item.player)
 				local row, nameLabel = F.coreRowOf(coreList, item.player)
-				if row then
-					if not nameLabel then
-						nameLabel = findLabel(row, "PlayerName")
-					end
-					for _, icon in ipairs(F.friendIconsIn(row, nameLabel)) do
-						want[icon] = true
-						F.hideIcon(icon)
-					end
+				if row and not nameLabel then
+					nameLabel = findLabel(row, "PlayerName")
+				end
+				local icons = row and F.friendIconsIn(row, nameLabel, real) or {}
+				for _, icon in ipairs(icons) do
+					want[icon] = true
+					F.hideIcon(icon)
+				end
+				if #icons == 0 and real and coreList.Enabled ~= false then
+					F.dumpRow(item.player, row, nameLabel)
 				end
 			end
 		end
