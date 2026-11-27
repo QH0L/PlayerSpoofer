@@ -2349,6 +2349,28 @@ local function fixImage(d, list)
 	end
 	return false
 end
+-- turns one "Friend" label into "Add Friend" if its row belongs to a player whose friend status is hidden
+function F.fixFriendLabel(d, list)
+	local row = F.rowAround(d)
+	for _, item in ipairs(list) do
+		if item.entry.hideFriend and F.rowBelongsTo(row, item) then
+			if not friendTexts[d] then
+				local st = { original = d.Text, desired = "Add Friend" }
+				friendTexts[d] = st
+				d.Text = st.desired
+				st.conn = d:GetPropertyChangedSignal("Text"):Connect(function()
+					if d.Text ~= st.desired and friendTexts[d] == st then
+						st.original = d.Text
+						d.Text = st.desired
+					end
+				end)
+				pcall(F.applyBoxStyle, d, st)
+			end
+			return true
+		end
+	end
+	return false
+end
 function F.scanCoreBody(list)
 	if not CoreGuiRoot then
 		return
@@ -2382,25 +2404,8 @@ function F.scanCoreBody(list)
 				if d.Text == "Add Friend" and not current and not template then
 					template = d
 				end
-				if isFriendWord(d.Text) or current then
-					local row = F.rowAround(d)
-					for _, item in ipairs(list) do
-						if item.entry.hideFriend and F.rowBelongsTo(row, item) then
-							wantFriend[d] = true
-							if not current then
-								local st = { original = d.Text, desired = "Add Friend" }
-								friendTexts[d] = st
-								d.Text = st.desired
-								st.conn = d:GetPropertyChangedSignal("Text"):Connect(function()
-									if d.Text ~= st.desired and friendTexts[d] == st then
-										st.original = d.Text
-										d.Text = st.desired
-									end
-								end)
-							end
-							break
-						end
-					end
+				if (isFriendWord(d.Text) or current) and F.fixFriendLabel(d, list) then
+					wantFriend[d] = true
 				end
 			elseif isImageObject(d) then
 				if fixImage(d, list) then
@@ -2471,6 +2476,7 @@ local function handleCoreObject(d)
 			processTag(d, list)
 		end
 		if isFriendWord(d.Text) then
+			pcall(F.fixFriendLabel, d, list) -- same frame, so the real "Friend" never renders
 			queueScan()
 		end
 	elseif isImageObject(d) then
@@ -2531,6 +2537,120 @@ local function menuOpen()
 	end)
 	return ok and value == true
 end
+-- ---------- stock Roblox Tab list: friend icon ----------
+F.friendHidden = setmetatable({}, { __mode = "k" })
+F.friendCache = {}
+function F.isRealFriend(player)
+	local cached = F.friendCache[player.UserId]
+	if cached ~= nil then
+		return cached
+	end
+	F.friendCache[player.UserId] = false
+	task.spawn(function()
+		local ok, value = pcall(LocalPlayer.IsFriendsWith, LocalPlayer, player.UserId)
+		F.friendCache[player.UserId] = ok and value == true
+		if ok and value == true then
+			pcall(F.syncFriendIcons, spoofedPlayers())
+		end
+	end)
+	return false
+end
+function F.hideIcon(icon)
+	if F.friendHidden[icon] then
+		return
+	end
+	local st = { visible = icon.Visible }
+	F.friendHidden[icon] = st
+	icon.Visible = false
+	st.conn = icon:GetPropertyChangedSignal("Visible"):Connect(function()
+		if F.friendHidden[icon] == st and icon.Visible then
+			st.visible = true
+			icon.Visible = false
+		end
+	end)
+end
+function F.unhideIcon(icon)
+	local st = F.friendHidden[icon]
+	if not st then
+		return
+	end
+	F.friendHidden[icon] = nil
+	st.conn:Disconnect()
+	if icon.Parent then
+		icon.Visible = st.visible
+	end
+end
+-- the row of one player in CoreGui.PlayerList: "p_<userId>" if present, else climb from the name label
+function F.coreRowOf(list, player)
+	local named = list:FindFirstChild("p_" .. player.UserId, true)
+	if named then
+		return named, nil
+	end
+	for _, d in ipairs(list:GetDescendants()) do
+		if isTextObject(d) and not isOurs(d) then
+			local st = tagWatch[d]
+			local text = trim(st and st.base or d.Text)
+			if text == player.DisplayName or text == player.Name then
+				local row = d
+				for _ = 1, 6 do
+					local parent = row.Parent
+					if not (parent and parent:IsA("GuiObject")) or parent == list then
+						break
+					end
+					if parent.AbsoluteSize.Y > math.max(80, d.AbsoluteSize.Y * 3) then
+						break
+					end
+					row = parent
+				end
+				return row, d
+			end
+		end
+	end
+	return nil, nil
+end
+function F.friendIconsIn(row, nameLabel)
+	local out = {}
+	for _, d in ipairs(row:GetDescendants()) do
+		if isImageObject(d) and not isOurs(d) then
+			local ov = imageOverrides[d]
+			local image = toStr((ov and ov.original) or d.Image):lower()
+			local name = d.Name:lower()
+			local thumb = image:find("rbxthumb", 1, true) or image:find("headshot", 1, true) or image:find("avatar", 1, true)
+			local looksFriend = image:find("friend", 1, true) ~= nil or name:find("friend", 1, true) ~= nil
+			local looksIcon = name:find("icon", 1, true) ~= nil and d.AbsoluteSize.X <= 40
+			local leftOfName = (nameLabel == nil) or (d.AbsolutePosition.X + d.AbsoluteSize.X <= nameLabel.AbsolutePosition.X + 6)
+			if not thumb and (looksFriend or (looksIcon and leftOfName)) then
+				out[#out + 1] = d
+			end
+		end
+	end
+	return out
+end
+function F.syncFriendIcons(list)
+	local want = {}
+	local coreList = CoreGuiRoot and CoreGuiRoot:FindFirstChild("PlayerList")
+	if coreList then
+		for _, item in ipairs(list) do
+			if item.entry.hideFriend and F.isRealFriend(item.player) then
+				local row, nameLabel = F.coreRowOf(coreList, item.player)
+				if row then
+					if not nameLabel then
+						nameLabel = findLabel(row, "PlayerName")
+					end
+					for _, icon in ipairs(F.friendIconsIn(row, nameLabel)) do
+						want[icon] = true
+						F.hideIcon(icon)
+					end
+				end
+			end
+		end
+	end
+	for icon in pairs(F.friendHidden) do
+		if not want[icon] then
+			F.unhideIcon(icon)
+		end
+	end
+end
 local function retagAll(includeWorkspace)
 	local list = spoofedPlayers()
 	local changed, paths = 0, {}
@@ -2560,10 +2680,22 @@ local function retagAll(includeWorkspace)
 		for label in pairs(tagWatch) do
 			pcall(unwatchTag, label)
 		end
+		pcall(F.syncFriendIcons, list)
 		pcall(F.scanCore, list)
 		return 0, paths
 	end
 	visit(PlayerGui, false)
+	-- labels tagged earlier (Tab list, Esc menu, billboards) get the NEW names now, not on the next Esc
+	for label in pairs(tagWatch) do
+		if label.Parent and not isOurs(label) then
+			processTag(label, list)
+		end
+	end
+	local coreList = CoreGuiRoot and CoreGuiRoot:FindFirstChild("PlayerList")
+	if coreList then
+		visit(coreList, false)
+	end
+	pcall(F.syncFriendIcons, list)
 	for _, item in ipairs(list) do
 		local char = item.player.Character
 		if char then
@@ -2600,6 +2732,21 @@ track(GuiService.MenuOpened:Connect(function()
 		end)
 	end
 end))
+task.spawn(function()
+	while tagLoopAlive do
+		task.wait(0.5)
+		local need = next(F.friendHidden) ~= nil
+		for _, entry in pairs(spoofs) do
+			if entry.hideFriend then
+				need = true
+				break
+			end
+		end
+		if tagLoopAlive and need then
+			pcall(F.syncFriendIcons, spoofedPlayers())
+		end
+	end
+end)
 task.spawn(function()
 	while tagLoopAlive do
 		task.wait(4)
@@ -2757,6 +2904,7 @@ end
 function F.resetTarget(targetId, silent)
 	local previous = spoofs[targetId]
 	spoofs[targetId] = nil
+	F.listCache = nil
 	if not silent and F.syncAlive then
 		pcall(F.syncClear, targetId)
 	end
@@ -3286,6 +3434,7 @@ function F.onApply()
 		end
 		local previous = spoofs[targetId]
 		spoofs[targetId] = entry
+		F.listCache = nil
 		do
 			local statPlayer = Players:GetPlayerByUserId(targetId)
 			if statPlayer then
@@ -3615,7 +3764,7 @@ F.SYNC = {
 	LANES = 1, -- parallel tracks. 1 = single track (the path that worked). Try 2..4 only after 1 works; replication of several tracks is NOT verified
 	MAX_LANES = 8, -- receivers accept up to this many lanes per message
 	WARMUP = 0.25, -- wait after creating fresh tracks so remote clients can see them before the first symbol
-	REPEATS = 2, -- how many times a fresh Apply is sent back to back on every lane (receivers ignore duplicates)
+	REPEATS = 1, -- copies of a fresh Apply sent back to back; the LOOP re-sends anyway, so 1 gets the next change out sooner
 	LOOP = true, -- keep re-sending every local spoof in a loop when nothing new is queued (a late or missed receiver catches the next START)
 	REANNOUNCE_REPEATS = 1,
 	TRACK_IDLE_SECONDS = 30, -- keep the tracks alive this long after the last symbol (always while a local spoof exists) so the next send starts at once
@@ -4143,6 +4292,7 @@ end
 function F.syncCommit(targetId, entry)
 	local previous = spoofs[targetId]
 	spoofs[targetId] = entry
+	F.listCache = nil
 	local player = Players:GetPlayerByUserId(targetId)
 	if player then
 		pcall(applyLeaderstats, player, entry)
@@ -4205,8 +4355,8 @@ function F.syncApplySet(sender, targetId, entry, key)
 	task.spawn(function()
 		local pending = 0
 		if entry.userId then
-			pending = 2
-			-- resolve the name and download the fake avatar at the same time
+			pending = 1
+			-- resolve the name now; the avatar download runs alongside and does not hold the UI back
 			task.spawn(function()
 				local okName, canonical = pcall(Players.GetNameFromUserIdAsync, Players, entry.userId)
 				if okName and luaType(canonical) == "string" then
@@ -4226,9 +4376,8 @@ function F.syncApplySet(sender, targetId, entry, key)
 				else
 					pcall(F.getAvatarModel, entry.userId)
 				end
-				pending = pending - 1
 			end)
-			local deadline = os.clock() + F.SYNC.PREFETCH_TIMEOUT
+			local deadline = os.clock() + math.min(F.SYNC.PREFETCH_TIMEOUT, 5)
 			while pending > 0 and os.clock() < deadline do
 				task.wait()
 			end
