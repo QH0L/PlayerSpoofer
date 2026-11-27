@@ -83,6 +83,15 @@ for _, option in ipairs(RANK_OPTIONS) do
 	RANKS[option.key] = option
 end
 local spoofs = {}
+-- friend icon is a LOCAL viewing choice per player: never synced, works with or without a spoof
+F.friendPref = {} -- [userId] = true -> hide the friend status of that player on this screen
+F.friendOnly = {} -- [userId] = { hideFriend = true } for players hidden without a spoof
+function F.viewEntry(userId)
+	return spoofs[userId] or F.friendOnly[userId]
+end
+function F.anyActive()
+	return next(spoofs) ~= nil or next(F.friendOnly) ~= nil
+end
 local shadows = setmetatable({}, { __mode = "k" })
 local imageOverrides = setmetatable({}, { __mode = "k" })
 local snapshots = setmetatable({}, { __mode = "k" })
@@ -238,6 +247,12 @@ local function parseCount(text)
 	end
 	return nil
 end
+-- a stat typed as "-" shows a dash and sorts last: the real leaderstat is held at DASH_VALUE
+F.DASH_VALUE = -999999999
+function F.isDash(text)
+	local t = trim(toStr(text))
+	return t == "-" or t == "\u{2013}" or t == "\u{2014}"
+end
 local function groupDigits(n)
 	local sign = n < 0 and "-" or ""
 	local digits = toStr(math.floor(math.abs(n)))
@@ -302,6 +317,9 @@ function applyLeaderstats(player, entry)
 		if folder then
 			for name, text in pairs(entry.stats) do
 				local number = parseCount(text)
+				if number == nil and F.isDash(text) then
+					number = F.DASH_VALUE
+				end
 				local obj = number and folder:FindFirstChild(name)
 				if obj and (obj:IsA("IntValue") or obj:IsA("NumberValue")) then
 					wanted[name] = number
@@ -349,7 +367,7 @@ function applyLeaderstats(player, entry)
 				end
 				local delta = value - st.real
 				st.real = value
-				if delta > 0 then
+				if delta > 0 and st.fake ~= F.DASH_VALUE then
 					st.fake = st.fake + delta
 					local current = spoofs[userId]
 					if current and current.stats then
@@ -416,7 +434,7 @@ function F.applyStats(row, userId)
 			if label then
 				local statName = cell.Name:sub(#STAT_PREFIX + 1)
 				local text = entry and entry.stats and entry.stats[statName]
-				if statData[userId] and statData[userId][statName] then
+				if statData[userId] and statData[userId][statName] and not F.isDash(text) then
 					text = nil
 				end
 				if text then
@@ -455,7 +473,7 @@ function F.applyFriendIcon(row, entry)
 	end
 end
 function F.applyRow(row, userId)
-	local entry = spoofs[userId]
+	local entry = F.viewEntry(userId)
 	local nameLabel = findLabel(row:FindFirstChild("NameFrame", true) or row, "PlayerName")
 	if nameLabel then
 		local text = nameOverrideText(Players:GetPlayerByUserId(userId), entry)
@@ -482,7 +500,7 @@ function F.applyDropdown(info)
 	if not (info and info.frame.Parent) then
 		return
 	end
-	local entry = spoofs[info.player.UserId]
+	local entry = F.viewEntry(info.player.UserId)
 	local header = info.header
 	local displayLabel = findLabel(header, "DisplayName")
 	if displayLabel then
@@ -2060,13 +2078,38 @@ local function spoofedPlayers()
 			})
 		end
 	end
+	for userId, entry in pairs(F.friendOnly) do
+		local player = not spoofs[userId] and Players:GetPlayerByUserId(userId)
+		if player then
+			table.insert(list, { player = player, entry = entry })
+		end
+	end
 	return list
 end
+-- every spoof replaces the ORIGINAL names only: a replacement is a placeholder until the end,
+-- so if someone is spoofed as your real name, your own spoof does not rename them again
 local function applyAllNames(text, list, rich)
-	for _, item in ipairs(list) do
-		text = spoofTagText(text, item.player, item.displayNew, item.userNew, rich) or text
+	local subs = {}
+	for i, item in ipairs(list) do
+		local dTok = item.displayNew and ("\1#" .. i .. "#d\1") or nil
+		local uTok = item.userNew and ("\1#" .. i .. "#u\1") or nil
+		local out = spoofTagText(text, item.player, dTok, uTok, false)
+		if out then
+			text = out
+			if dTok then
+				subs[dTok] = rich and escapeRich(item.displayNew) or item.displayNew
+			end
+			if uTok then
+				subs[uTok] = rich and escapeRich(item.userNew) or item.userNew
+			end
+		end
 	end
-	return text
+	if next(subs) == nil then
+		return text
+	end
+	return (text:gsub("\1#%d+#[du]\1", function(tok)
+		return subs[tok] or ""
+	end))
 end
 local function unwatchTag(label)
 	local st = tagWatch[label]
@@ -2452,13 +2495,13 @@ local function queueScan()
 	scanQueued = true
 	task.defer(function()
 		scanQueued = false
-		if tagLoopAlive and next(spoofs) ~= nil then
+		if tagLoopAlive and F.anyActive() then
 			pcall(F.scanCore, spoofedPlayers())
 		end
 	end)
 end
 local function handleCoreObject(d)
-	if next(spoofs) == nil or isOurs(d) then
+	if not F.anyActive() or isOurs(d) then
 		return
 	end
 	local now = os.clock()
@@ -2626,6 +2669,66 @@ function F.friendIconsIn(row, nameLabel)
 	end
 	return out
 end
+F.dashTexts = setmetatable({}, { __mode = "k" })
+function F.looksNegative(text)
+	return toStr(text):match("^%s*%-%s*[%d%.,]") ~= nil
+end
+function F.releaseDash(label)
+	local st = F.dashTexts[label]
+	if not st then
+		return
+	end
+	F.dashTexts[label] = nil
+	st.conn:Disconnect()
+	if label.Parent and label.Text == "-" then
+		label.Text = st.original
+	end
+end
+function F.syncDashStats(list)
+	local want = {}
+	local coreList = CoreGuiRoot and CoreGuiRoot:FindFirstChild("PlayerList")
+	if coreList then
+		for _, item in ipairs(list) do
+			local hasDash = false
+			for _, text in pairs(item.entry.stats or {}) do
+				if F.isDash(text) then
+					hasDash = true
+				end
+			end
+			if hasDash then
+				local row = F.coreRowOf(coreList, item.player)
+				if row then
+					for _, d in ipairs(row:GetDescendants()) do
+						if isTextObject(d) and not isOurs(d) and (F.dashTexts[d] or F.looksNegative(d.Text)) then
+							want[d] = true
+							if not F.dashTexts[d] then
+								local st = { original = d.Text }
+								F.dashTexts[d] = st
+								d.Text = "-"
+								st.conn = d:GetPropertyChangedSignal("Text"):Connect(function()
+									if F.dashTexts[d] ~= st or d.Text == "-" then
+										return
+									end
+									if F.looksNegative(d.Text) then
+										st.original = d.Text
+										d.Text = "-"
+									else
+										F.releaseDash(d)
+									end
+								end)
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	for label in pairs(F.dashTexts) do
+		if not want[label] then
+			F.releaseDash(label)
+		end
+	end
+end
 function F.syncFriendIcons(list)
 	local want = {}
 	local coreList = CoreGuiRoot and CoreGuiRoot:FindFirstChild("PlayerList")
@@ -2681,6 +2784,7 @@ local function retagAll(includeWorkspace)
 			pcall(unwatchTag, label)
 		end
 		pcall(F.syncFriendIcons, list)
+		pcall(F.syncDashStats, list)
 		pcall(F.scanCore, list)
 		return 0, paths
 	end
@@ -2696,6 +2800,7 @@ local function retagAll(includeWorkspace)
 		visit(coreList, false)
 	end
 	pcall(F.syncFriendIcons, list)
+	pcall(F.syncDashStats, list)
 	for _, item in ipairs(list) do
 		local char = item.player.Character
 		if char then
@@ -2718,7 +2823,7 @@ end
 task.spawn(function()
 	while tagLoopAlive do
 		task.wait(1.5)
-		if tagLoopAlive and CoreGuiRoot and next(spoofs) ~= nil and menuOpen() then
+		if tagLoopAlive and CoreGuiRoot and F.anyActive() and menuOpen() then
 			pcall(F.scanCore, spoofedPlayers())
 		end
 	end
@@ -2726,7 +2831,7 @@ end)
 track(GuiService.MenuOpened:Connect(function()
 	for _, delay in ipairs({ 0, 0.15, 0.5 }) do
 		task.delay(delay, function()
-			if tagLoopAlive and CoreGuiRoot and next(spoofs) ~= nil then
+			if tagLoopAlive and CoreGuiRoot and F.anyActive() then
 				pcall(F.scanCore, spoofedPlayers())
 			end
 		end)
@@ -2735,22 +2840,28 @@ end))
 task.spawn(function()
 	while tagLoopAlive do
 		task.wait(0.5)
-		local need = next(F.friendHidden) ~= nil
+		local need = next(F.friendHidden) ~= nil or next(F.dashTexts) ~= nil or next(F.friendOnly) ~= nil
 		for _, entry in pairs(spoofs) do
 			if entry.hideFriend then
 				need = true
-				break
+			end
+			for _, text in pairs(entry.stats or {}) do
+				if F.isDash(text) then
+					need = true
+				end
 			end
 		end
 		if tagLoopAlive and need then
-			pcall(F.syncFriendIcons, spoofedPlayers())
+			local list = spoofedPlayers()
+			pcall(F.syncFriendIcons, list)
+			pcall(F.syncDashStats, list)
 		end
 	end
 end)
 task.spawn(function()
 	while tagLoopAlive do
 		task.wait(4)
-		if tagLoopAlive and next(spoofs) ~= nil then
+		if tagLoopAlive and F.anyActive() then
 			pcall(retagAll, false)
 		end
 	end
@@ -2904,6 +3015,9 @@ end
 function F.resetTarget(targetId, silent)
 	local previous = spoofs[targetId]
 	spoofs[targetId] = nil
+	if F.friendPref[targetId] then
+		F.friendOnly[targetId] = { hideFriend = true }
+	end
 	F.listCache = nil
 	if not silent and F.syncAlive then
 		pcall(F.syncClear, targetId)
@@ -3150,6 +3264,13 @@ function F.buildEditor()
 	end
 	friendBtn.Activated:Connect(function()
 		ed.setHideFriend(not ed.hideFriend)
+		if editor and editor.targetId then
+			local ok, err = pcall(F.setFriendPref, editor.targetId, ed.hideFriend)
+			if not ok then
+				warn(TAG .. "friend toggle failed: " .. toStr(err))
+			end
+			F.setStatus(ed.hideFriend and "Friend status hidden (only on your screen)" or "Friend status shown", COLOR_MUTED)
+		end
 	end)
 	ed.premium = nil
 	local premiumBtn = make("TextButton", {
@@ -3351,7 +3472,7 @@ function F.openEditor(player, aboveMenu)
 	editor.userBox.Text = entry and entry.username or ""
 	editor.setRank(entry and entry.rank or nil)
 	editor.rankNumBox.Text = entry and entry.rankNumber and toStr(entry.rankNumber) or ""
-	editor.setHideFriend(entry and entry.hideFriend or false)
+	editor.setHideFriend(F.friendPref[player.UserId] == true)
 	editor.setPremium(entry and entry.premium)
 	editor.setDevice(entry and entry.device or nil)
 	F.rebuildStats(player, entry)
@@ -3377,7 +3498,6 @@ function F.onApply()
 			rankNumber = toNum(raw)
 		end
 	end
-	local hideFriend = editor.hideFriend
 	local premium = editor.premium
 	local device = editor.device
 	local stats = {}
@@ -3393,7 +3513,7 @@ function F.onApply()
 	if next(stats) == nil then
 		stats = nil
 	end
-	if display == "" and username == "" and not rank and rankNumber == nil and not stats and not hideFriend and premium == nil and not device then
+	if display == "" and username == "" and not rank and rankNumber == nil and not stats and premium == nil and not device then
 		F.resetTarget(targetId)
 		F.setStatus("Nothing entered - showing real values", COLOR_MUTED)
 		return
@@ -3415,7 +3535,7 @@ function F.onApply()
 			rank = rank,
 			rankNumber = rankNumber,
 			stats = stats,
-			hideFriend = hideFriend or nil,
+			hideFriend = F.friendPref[targetId],
 			premium = premium,
 			device = device,
 		}
@@ -3474,6 +3594,30 @@ function F.onApply()
 		say(message, color)
 	end)
 end
+function F.setFriendPref(userId, hide)
+	hide = hide == true
+	F.friendPref[userId] = hide or nil
+	local entry = spoofs[userId]
+	if entry then
+		entry.hideFriend = hide or nil
+		F.friendOnly[userId] = nil
+	else
+		F.friendOnly[userId] = hide and { hideFriend = true } or nil
+	end
+	F.listCache = nil
+	pcall(refresh, userId)
+	task.spawn(function()
+		local list = spoofedPlayers()
+		pcall(retagAll, false)
+		pcall(F.syncFriendIcons, list)
+		if CoreGuiRoot then
+			pcall(F.scanCore, list)
+		end
+	end)
+	if hide then
+		pcall(ensureCoreWatch)
+	end
+end
 editor = F.buildEditor()
 editor.applyBtn.Activated:Connect(F.onApply)
 editor.resetBtn.Activated:Connect(function()
@@ -3486,6 +3630,7 @@ editor.resetBtn.Activated:Connect(function()
 	editor.setRank(nil)
 	editor.rankNumBox.Text = ""
 	editor.setHideFriend(false)
+	pcall(F.setFriendPref, editor.targetId, false)
 	editor.setPremium(nil)
 	editor.setDeviceIndex(0)
 	for _, item in ipairs(editor.statBoxes) do
@@ -4049,7 +4194,7 @@ function F.syncEncodeSet(targetId, entry)
 	if entry.userId then lo = lo + 2 end
 	if rankIndex then lo = lo + 4 end
 	if entry.rankNumber ~= nil then lo = lo + 8 end
-	if entry.hideFriend then lo = lo + 16 end
+	-- bit 16 (friend icon) is no longer sent: each viewer decides that on their own screen
 	if entry.premium ~= nil then lo = lo + 32 end
 	if entry.premium == true then lo = lo + 64 end
 	if deviceIndex then ext = ext + 1 end
@@ -4138,9 +4283,7 @@ function F.syncDecode(bytes)
 	if F.syncHasBit(lo, 8) then
 		entry.rankNumber = F.rVarint(r)
 	end
-	if F.syncHasBit(lo, 16) then
-		entry.hideFriend = true
-	end
+	-- bit 16 from older senders is ignored on purpose
 	if F.syncHasBit(lo, 32) then
 		entry.premium = F.syncHasBit(lo, 64)
 	end
@@ -4291,6 +4434,7 @@ end
 -- ---------- applying received spoofs ----------
 function F.syncCommit(targetId, entry)
 	local previous = spoofs[targetId]
+	entry.hideFriend = F.friendPref[targetId]
 	spoofs[targetId] = entry
 	F.listCache = nil
 	local player = Players:GetPlayerByUserId(targetId)
